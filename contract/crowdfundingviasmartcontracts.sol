@@ -15,6 +15,7 @@ contract Crowdfunding {
     event CampaignCreated(uint256 campaignId, address creator, uint256 goal);
     event Funded(uint256 campaignId, address funder, uint256 amount);
     event CampaignCompleted(uint256 campaignId);
+    event GoalUpdated(uint256 campaignId, uint256 newGoal);
 
     function createCampaign(uint256 _goal) public {
         campaignCount++;
@@ -40,5 +41,31 @@ contract Crowdfunding {
             campaign.creator.transfer(campaign.amountRaised);
             emit CampaignCompleted(_campaignId);
         }
+    }
+
+    function updateGoal(uint256 _campaignId, uint256 _newGoal) public {
+        Campaign storage campaign = campaigns[_campaignId];
+        require(msg.sender == campaign.creator, "Only the creator can update the goal");
+        require(!campaign.isCompleted, "Cannot update goal of a completed campaign");
+        require(_newGoal > campaign.amountRaised, "New goal must be greater than the amount raised");
+
+        campaign.goal = _newGoal;
+        emit GoalUpdated(_campaignId, _newGoal);
+    }
+
+    function getCampaignCount() public view returns (uint256) {
+        return campaignCount;
+    }
+
+    function isCampaignCompleted(uint256 _campaignId) public view returns (bool) {
+        return campaigns[_campaignId].isCompleted;
+    }
+
+    function getAmountRaised(uint256 _campaignId) public view returns (uint256) {
+        return campaigns[_campaignId].amountRaised;
+    }
+
+    function getCreator(uint256 _campaignId) public view returns (address) {
+        return campaigns[_campaignId].creator;
     }
 }
