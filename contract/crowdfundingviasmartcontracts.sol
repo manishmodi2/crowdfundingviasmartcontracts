@@ -8,6 +8,12 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 contract CrowdfundingPro is Ownable, Pausable {
     using SafeMath for uint256;
 
+    struct Milestone {
+        uint256 amount;
+        string description;
+        bool isCompleted;
+    }
+
     struct Campaign {
         address payable creator;
         uint256 goal;
@@ -22,12 +28,21 @@ contract CrowdfundingPro is Ownable, Pausable {
         string imageHash;
         mapping(address => uint256) contributions;
         address[] contributors;
+        Milestone[] milestones;
+        bool hasWithdrawalLimit;
+        uint256 withdrawalLimit;
+        uint256 totalWithdrawn;
+        uint256 category; // 1=Tech, 2=Art, 3=Charity, etc.
+        bool isVerified;
     }
 
     uint256 private campaignCounter;
     mapping(uint256 => Campaign) private campaigns;
     uint256 public platformFee = 250; // Represents 2.5% (250 basis points)
     mapping(address => uint256[]) private userCampaigns;
+    mapping(address => bool) private verifiedCreators;
+    address[] private verifiedCreatorList;
+    uint256 public totalPlatformFeesCollected;
 
     event CampaignCreated(uint256 indexed campaignId, address indexed creator, uint256 goal, uint256 deadline);
     event ContributionReceived(uint256 indexed campaignId, address indexed contributor, uint256 amount);
@@ -41,6 +56,14 @@ contract CrowdfundingPro is Ownable, Pausable {
     event CampaignDetailsUpdated(uint256 indexed campaignId);
     event EmergencyStopActivated(uint256 indexed campaignId);
     event MilestoneAdded(uint256 indexed campaignId, uint256 amount, string description);
+    event MilestoneCompleted(uint256 indexed campaignId, uint256 milestoneId);
+    event CreatorVerified(address indexed creator);
+    event CreatorUnverified(address indexed creator);
+    event CampaignVerified(uint256 indexed campaignId);
+    event CampaignPromoted(uint256 indexed campaignId, uint256 promotionFee);
+    event WithdrawalLimitSet(uint256 indexed campaignId, uint256 limit);
+    event CategoryChanged(uint256 indexed campaignId, uint256 newCategory);
+    event FundsRecovered(address indexed recipient, uint256 amount);
 
     modifier campaignExists(uint256 _campaignId) {
         require(_campaignId > 0 && _campaignId <= campaignCounter, "Campaign does not exist");
@@ -49,6 +72,11 @@ contract CrowdfundingPro is Ownable, Pausable {
 
     modifier onlyCreator(uint256 _campaignId) {
         require(msg.sender == campaigns[_campaignId].creator, "Only campaign creator");
+        _;
+    }
+
+    modifier onlyVerifiedCreator() {
+        require(verifiedCreators[msg.sender], "Only verified creators");
         _;
     }
 
@@ -61,13 +89,19 @@ contract CrowdfundingPro is Ownable, Pausable {
         uint256 _durationInDays,
         string memory _title,
         string memory _description,
-        string memory _imageHash
+        string memory _imageHash,
+        uint256 _category,
+        bool _hasWithdrawalLimit,
+        uint256 _withdrawalLimit
     ) external whenNotPaused {
         require(_goal > 0, "Goal must be greater than zero");
         require(_minContribution > 0, "Minimum contribution must be greater than zero");
         require(_maxContribution >= _minContribution, "Max contribution must be >= min");
         require(_durationInDays > 0, "Duration must be greater than zero");
         require(bytes(_title).length > 0, "Title is required");
+        if (_hasWithdrawalLimit) {
+            require(_withdrawalLimit > 0, "Withdrawal limit must be greater than zero");
+        }
 
         campaignCounter++;
         Campaign storage c = campaigns[campaignCounter];
@@ -79,6 +113,10 @@ contract CrowdfundingPro is Ownable, Pausable {
         c.title = _title;
         c.description = _description;
         c.imageHash = _imageHash;
+        c.category = _category;
+        c.hasWithdrawalLimit = _hasWithdrawalLimit;
+        c.withdrawalLimit = _withdrawalLimit;
+        c.isVerified = verifiedCreators[msg.sender];
 
         userCampaigns[msg.sender].push(campaignCounter);
 
@@ -107,9 +145,12 @@ contract CrowdfundingPro is Ownable, Pausable {
             uint256 payout = c.amountRaised - feeAmount;
             c.creator.transfer(payout);
             payable(owner()).transfer(feeAmount);
+            totalPlatformFeesCollected += feeAmount;
             emit CampaignSuccessful(_campaignId);
         }
     }
+
+    // ========== CAMPAIGN MANAGEMENT FUNCTIONS ==========
 
     function modifyGoal(uint256 _campaignId, uint256 _newGoal) external campaignExists(_campaignId) onlyCreator(_campaignId) {
         Campaign storage c = campaigns[_campaignId];
@@ -176,12 +217,11 @@ contract CrowdfundingPro is Ownable, Pausable {
     function extendDeadline(uint256 _campaignId, uint256 _additionalDays) external campaignExists(_campaignId) onlyCreator(_campaignId) {
         Campaign storage c = campaigns[_campaignId];
         require(!c.isCompleted, "Campaign already completed");
+        require(_additionalDays > 0, "Must extend by at least 1 day");
 
         c.deadline += _additionalDays * 1 days;
         emit DeadlineExtended(_campaignId, c.deadline);
     }
-
-    // ========== NEW FUNCTIONS ==========
 
     function updateCampaignDetails(
         uint256 _campaignId,
@@ -212,6 +252,205 @@ contract CrowdfundingPro is Ownable, Pausable {
         
         c.isRefundable = true;
         emit EmergencyStopActivated(_campaignId);
+    }
+
+    // ========== MILESTONE FUNCTIONS ==========
+
+    function addMilestone(
+        uint256 _campaignId,
+        uint256 _amount,
+        string memory _description
+    ) external campaignExists(_campaignId) onlyCreator(_campaignId) {
+        Campaign storage c = campaigns[_campaignId];
+        require(!c.isCompleted, "Campaign already completed");
+
+        c.milestones.push(Milestone({
+            amount: _amount,
+            description: _description,
+            isCompleted: false
+        }));
+
+        emit MilestoneAdded(_campaignId, _amount, _description);
+    }
+
+    function completeMilestone(uint256 _campaignId, uint256 _milestoneId) 
+        external 
+        campaignExists(_campaignId) 
+        onlyCreator(_campaignId) 
+    {
+        Campaign storage c = campaigns[_campaignId];
+        require(_milestoneId < c.milestones.length, "Invalid milestone ID");
+        require(!c.milestones[_milestoneId].isCompleted, "Milestone already completed");
+        require(c.isCompleted, "Campaign not yet successful");
+
+        Milestone storage m = c.milestones[_milestoneId];
+        
+        if (c.hasWithdrawalLimit) {
+            require(c.totalWithdrawn + m.amount <= c.withdrawalLimit, "Exceeds withdrawal limit");
+        }
+
+        uint256 feeAmount = (m.amount * platformFee) / 10000;
+        uint256 payout = m.amount - feeAmount;
+        
+        c.creator.transfer(payout);
+        payable(owner()).transfer(feeAmount);
+        totalPlatformFeesCollected += feeAmount;
+        
+        m.isCompleted = true;
+        c.totalWithdrawn += m.amount;
+        
+        emit MilestoneCompleted(_campaignId, _milestoneId);
+    }
+
+    // ========== VERIFICATION & PROMOTION ==========
+
+    function verifyCreator(address _creator) external onlyOwner {
+        require(!verifiedCreators[_creator], "Already verified");
+        verifiedCreators[_creator] = true;
+        verifiedCreatorList.push(_creator);
+        
+        // Mark all their campaigns as verified
+        uint256[] storage creatorCampaigns = userCampaigns[_creator];
+        for (uint256 i = 0; i < creatorCampaigns.length; i++) {
+            campaigns[creatorCampaigns[i]].isVerified = true;
+        }
+        
+        emit CreatorVerified(_creator);
+    }
+
+    function unverifyCreator(address _creator) external onlyOwner {
+        require(verifiedCreators[_creator], "Not verified");
+        verifiedCreators[_creator] = false;
+        
+        // Remove from verifiedCreatorList
+        for (uint256 i = 0; i < verifiedCreatorList.length; i++) {
+            if (verifiedCreatorList[i] == _creator) {
+                verifiedCreatorList[i] = verifiedCreatorList[verifiedCreatorList.length - 1];
+                verifiedCreatorList.pop();
+                break;
+            }
+        }
+        
+        emit CreatorUnverified(_creator);
+    }
+
+    function verifyCampaign(uint256 _campaignId) external onlyOwner campaignExists(_campaignId) {
+        Campaign storage c = campaigns[_campaignId];
+        require(!c.isVerified, "Already verified");
+        
+        c.isVerified = true;
+        emit CampaignVerified(_campaignId);
+    }
+
+    function promoteCampaign(uint256 _campaignId, uint256 _promotionFee) 
+        external 
+        payable 
+        campaignExists(_campaignId) 
+        onlyCreator(_campaignId) 
+    {
+        require(msg.value == _promotionFee, "Incorrect promotion fee");
+        require(_promotionFee > 0, "Promotion fee required");
+        
+        payable(owner()).transfer(_promotionFee);
+        totalPlatformFeesCollected += _promotionFee;
+        
+        emit CampaignPromoted(_campaignId, _promotionFee);
+    }
+
+    // ========== WITHDRAWAL LIMIT FUNCTIONS ==========
+
+    function setWithdrawalLimit(uint256 _campaignId, uint256 _limit) 
+        external 
+        campaignExists(_campaignId) 
+        onlyCreator(_campaignId) 
+    {
+        Campaign storage c = campaigns[_campaignId];
+        require(!c.isCompleted, "Campaign already completed");
+        
+        c.hasWithdrawalLimit = true;
+        c.withdrawalLimit = _limit;
+        
+        emit WithdrawalLimitSet(_campaignId, _limit);
+    }
+
+    function removeWithdrawalLimit(uint256 _campaignId) 
+        external 
+        campaignExists(_campaignId) 
+        onlyCreator(_campaignId) 
+    {
+        Campaign storage c = campaigns[_campaignId];
+        require(!c.isCompleted, "Campaign already completed");
+        
+        c.hasWithdrawalLimit = false;
+        c.withdrawalLimit = 0;
+    }
+
+    // ========== CATEGORY MANAGEMENT ==========
+
+    function setCampaignCategory(uint256 _campaignId, uint256 _newCategory) 
+        external 
+        campaignExists(_campaignId) 
+        onlyCreator(_campaignId) 
+    {
+        Campaign storage c = campaigns[_campaignId];
+        require(!c.isCompleted, "Campaign already completed");
+        
+        c.category = _newCategory;
+        emit CategoryChanged(_campaignId, _newCategory);
+    }
+
+    // ========== FUNDS RECOVERY ==========
+
+    function recoverFunds(address payable _recipient, uint256 _amount) external onlyOwner {
+        require(_amount <= address(this).balance, "Insufficient contract balance");
+        _recipient.transfer(_amount);
+        emit FundsRecovered(_recipient, _amount);
+    }
+
+    // ========== VIEW FUNCTIONS ==========
+
+    function getCampaignSummary(uint256 _campaignId)
+        external
+        view
+        campaignExists(_campaignId)
+        returns (
+            address creator,
+            uint256 goal,
+            uint256 raised,
+            bool completed,
+            bool refundable,
+            uint256 minContribution,
+            uint256 maxContribution,
+            uint256 deadline,
+            string memory title,
+            string memory description,
+            string memory imageHash,
+            uint256 category,
+            bool isVerified,
+            bool hasWithdrawalLimit,
+            uint256 withdrawalLimit,
+            uint256 totalWithdrawn
+        )
+    {
+        Campaign storage c = campaigns[_campaignId];
+        return (
+            c.creator,
+            c.goal,
+            c.amountRaised,
+            c.isCompleted,
+            c.isRefundable,
+            c.minContribution,
+            c.maxContribution,
+            c.deadline,
+            c.title,
+            c.description,
+            c.imageHash,
+            c.category,
+            c.isVerified,
+            c.hasWithdrawalLimit,
+            c.withdrawalLimit,
+            c.totalWithdrawn
+        );
     }
 
     function getCampaignMetadata(uint256 _campaignId) 
@@ -245,44 +484,6 @@ contract CrowdfundingPro is Ownable, Pausable {
         }
         
         return finalResult;
-    }
-
-    function withdrawMilestone(uint256 _campaignId, uint256 _amount) 
-        external 
-        campaignExists(_campaignId) 
-        onlyCreator(_campaignId) 
-    {
-        Campaign storage c = campaigns[_campaignId];
-        require(c.isCompleted, "Campaign not completed");
-        require(_amount <= c.amountRaised, "Amount exceeds raised funds");
-        
-        c.amountRaised = c.amountRaised.sub(_amount);
-        uint256 feeAmount = _amount.mul(platformFee).div(10000);
-        uint256 payout = _amount.sub(feeAmount);
-        
-        c.creator.transfer(payout);
-        payable(owner()).transfer(feeAmount);
-    }
-
-    function transferCampaignOwnership(uint256 _campaignId, address _newCreator) 
-        external 
-        campaignExists(_campaignId) 
-        onlyCreator(_campaignId) 
-    {
-        require(_newCreator != address(0), "Invalid address");
-        Campaign storage c = campaigns[_campaignId];
-        
-        uint256[] storage creatorCampaigns = userCampaigns[msg.sender];
-        for (uint256 i = 0; i < creatorCampaigns.length; i++) {
-            if (creatorCampaigns[i] == _campaignId) {
-                creatorCampaigns[i] = creatorCampaigns[creatorCampaigns.length - 1];
-                creatorCampaigns.pop();
-                break;
-            }
-        }
-        
-        userCampaigns[_newCreator].push(_campaignId);
-        c.creator = payable(_newCreator);
     }
 
     function getTotalContributions(address _contributor) external view returns (uint256) {
@@ -336,50 +537,72 @@ contract CrowdfundingPro is Ownable, Pausable {
         return finalResult;
     }
 
-    // ========== ADMIN FUNCTIONS ==========
-
-    function setPlatformFee(uint256 _newFee) external onlyOwner {
-        require(_newFee <= 1000, "Fee too high"); // Max 10%
-        platformFee = _newFee;
-        emit PlatformFeeUpdated(_newFee);
+    function getVerifiedCampaigns() external view returns (uint256[] memory) {
+        uint256[] memory result = new uint256[](campaignCounter);
+        uint256 count = 0;
+        
+        for (uint256 i = 1; i <= campaignCounter; i++) {
+            if (campaigns[i].isVerified) {
+                result[count] = i;
+                count++;
+            }
+        }
+        
+        uint256[] memory finalResult = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            finalResult[i] = result[i];
+        }
+        
+        return finalResult;
     }
 
-    function pause() external onlyOwner {
-        _pause();
+    function getCampaignsByCategory(uint256 _category) external view returns (uint256[] memory) {
+        uint256[] memory result = new uint256[](campaignCounter);
+        uint256 count = 0;
+        
+        for (uint256 i = 1; i <= campaignCounter; i++) {
+            if (campaigns[i].category == _category) {
+                result[count] = i;
+                count++;
+            }
+        }
+        
+        uint256[] memory finalResult = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            finalResult[i] = result[i];
+        }
+        
+        return finalResult;
     }
 
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    // ========== VIEW FUNCTIONS ==========
-
-    function getCampaignSummary(uint256 _campaignId)
-        external
-        view
-        campaignExists(_campaignId)
-        returns (
-            address creator,
-            uint256 goal,
-            uint256 raised,
-            bool completed,
-            bool refundable,
-            uint256 minContribution,
-            uint256 maxContribution,
-            uint256 deadline
-        )
+    function getMilestones(uint256 _campaignId) 
+        external 
+        view 
+        campaignExists(_campaignId) 
+        returns (uint256[] memory amounts, string[] memory descriptions, bool[] memory completedStatuses) 
     {
         Campaign storage c = campaigns[_campaignId];
-        return (
-            c.creator,
-            c.goal,
-            c.amountRaised,
-            c.isCompleted,
-            c.isRefundable,
-            c.minContribution,
-            c.maxContribution,
-            c.deadline
-        );
+        uint256 count = c.milestones.length;
+        
+        amounts = new uint256[](count);
+        descriptions = new string[](count);
+        completedStatuses = new bool[](count);
+        
+        for (uint256 i = 0; i < count; i++) {
+            amounts[i] = c.milestones[i].amount;
+            descriptions[i] = c.milestones[i].description;
+            completedStatuses[i] = c.milestones[i].isCompleted;
+        }
+        
+        return (amounts, descriptions, completedStatuses);
+    }
+
+    function getVerifiedCreators() external view returns (address[] memory) {
+        return verifiedCreatorList;
+    }
+
+    function isCreatorVerified(address _creator) external view returns (bool) {
+        return verifiedCreators[_creator];
     }
 
     function totalCampaigns() external view returns (uint256) {
@@ -421,5 +644,46 @@ contract CrowdfundingPro is Ownable, Pausable {
         } else {
             return c.deadline - block.timestamp;
         }
+    }
+
+    function getPlatformStats() external view returns (uint256 totalFees, uint256 totalCampaignsCreated, uint256 totalVerifiedCreators) {
+        return (totalPlatformFeesCollected, campaignCounter, verifiedCreatorList.length);
+    }
+
+    // ========== ADMIN FUNCTIONS ==========
+
+    function setPlatformFee(uint256 _newFee) external onlyOwner {
+        require(_newFee <= 1000, "Fee too high"); // Max 10%
+        platformFee = _newFee;
+        emit PlatformFeeUpdated(_newFee);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function transferCampaignOwnership(uint256 _campaignId, address _newCreator) 
+        external 
+        campaignExists(_campaignId) 
+        onlyCreator(_campaignId) 
+    {
+        require(_newCreator != address(0), "Invalid address");
+        Campaign storage c = campaigns[_campaignId];
+        
+        uint256[] storage creatorCampaigns = userCampaigns[msg.sender];
+        for (uint256 i = 0; i < creatorCampaigns.length; i++) {
+            if (creatorCampaigns[i] == _campaignId) {
+                creatorCampaigns[i] = creatorCampaigns[creatorCampaigns.length - 1];
+                creatorCampaigns.pop();
+                break;
+            }
+        }
+        
+        userCampaigns[_newCreator].push(_campaignId);
+        c.creator = payable(_newCreator);
     }
 }
